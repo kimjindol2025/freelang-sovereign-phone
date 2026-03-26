@@ -1,0 +1,611 @@
+// =============================================================================
+// Phase 10: Privacy Guard - Differential Privacy Engine
+// =============================================================================
+// Implements Differential Privacy (DP) for federated learning:
+//   - Laplace mechanism (pure DP)
+//   - Gaussian mechanism (approximate DP with (epsilon, delta))
+//   - Gradient clipping (sensitivity bounding)
+//   - Privacy budget accounting (Moments Accountant)
+//   - Secure aggregation protocol simulation
+//
+// Unforgiving Rule R2: epsilon < 0.1 (strong differential privacy)
+// =============================================================================
+
+// --- Privacy Types ----------------------------------------------------------
+
+struct PrivacyConfig {
+    mechanism: string,          // "laplace", "gaussian"
+    epsilon: f32,               // privacy budget per round
+    delta: f32,                 // failure probability (for gaussian)
+    total_epsilon_budget: f32,  // total budget across all rounds
+    sensitivity: f32,           // L2 sensitivity (max gradient norm)
+    clip_norm: f32,             // gradient clipping bound
+    noise_multiplier: f32,      // sigma = multiplier * sensitivity / epsilon
+    min_noise_scale: f32,       // floor for noise scale
+    composition: string         // "basic", "advanced", "rdp" (Renyi DP)
+}
+
+struct PrivacyBudget {
+    total_budget: f32,
+    spent_budget: f32,
+    remaining_budget: f32,
+    rounds_used: i32,
+    per_round_epsilon: f32,
+    rdp_alphas: array,          // Renyi divergence orders
+    rdp_epsilons: array,        // accumulated RDP epsilons per alpha
+    is_exhausted: bool
+}
+
+struct NoisedGradient {
+    original_norm: f32,
+    noised_values: array,       // gradient + noise
+    noise_scale: f32,
+    clipped: bool,
+    epsilon_cost: f32           // privacy cost of this operation
+}
+
+struct PrivacyGuard {
+    config: PrivacyConfig,
+    budget: PrivacyBudget,
+    rng_state: i32,             // PRNG state for noise generation
+    clip_stats: ClipStats,
+    noise_stats: NoiseStats,
+    total_queries: i32
+}
+
+struct ClipStats {
+    total_clips: i32,
+    total_gradients: i32,
+    clip_fraction: f32,
+    avg_original_norm: f32,
+    max_original_norm: f32
+}
+
+struct NoiseStats {
+    total_noise_added: f32,
+    avg_noise_scale: f32,
+    snr_history: array,         // signal-to-noise ratio per round
+    utility_estimate: f32       // estimated accuracy impact
+}
+
+struct SecureAggregation {
+    num_participants: i32,
+    threshold: i32,             // minimum participants for unmasking
+    masked_updates: array,
+    pairwise_masks: array,
+    is_complete: bool,
+    dropout_tolerance: f32      // fraction of clients that can drop
+}
+
+// --- Privacy Guard Creation ------------------------------------------------
+
+fn create_privacy_guard(epsilon: f32, delta: f32, sensitivity: f32) -> PrivacyGuard {
+    let config = PrivacyConfig {
+        mechanism: "gaussian",
+        epsilon: epsilon,
+        delta: delta,
+        total_epsilon_budget: epsilon * 1000,  // budget for 1000 rounds
+        sensitivity: sensitivity,
+        clip_norm: sensitivity,
+        noise_multiplier: 1.0,
+        min_noise_scale: 0.001,
+        composition: "rdp"
+    }
+
+    let budget = PrivacyBudget {
+        total_budget: config.total_epsilon_budget,
+        spent_budget: 0.0,
+        remaining_budget: config.total_epsilon_budget,
+        rounds_used: 0,
+        per_round_epsilon: epsilon,
+        rdp_alphas: [2.0, 5.0, 10.0, 20.0, 50.0, 100.0],
+        rdp_epsilons: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        is_exhausted: false
+    }
+
+    return PrivacyGuard {
+        config: config,
+        budget: budget,
+        rng_state: 42,
+        clip_stats: ClipStats {
+            total_clips: 0,
+            total_gradients: 0,
+            clip_fraction: 0.0,
+            avg_original_norm: 0.0,
+            max_original_norm: 0.0
+        },
+        noise_stats: NoiseStats {
+            total_noise_added: 0.0,
+            avg_noise_scale: 0.0,
+            snr_history: [],
+            utility_estimate: 1.0
+        },
+        total_queries: 0
+    }
+}
+
+fn create_strict_privacy_guard() -> PrivacyGuard {
+    // Ultra-strict: epsilon=0.05 (well below R2 threshold of 0.1)
+    return create_privacy_guard(0.05, 0.00001, 1.0)
+}
+
+// --- Gradient Clipping (Sensitivity Bounding) --------------------------------
+// Ensures per-sample gradient has bounded L2 norm
+
+fn clip_gradient(guard: PrivacyGuard, gradient: array) -> array {
+    let norm = vector_l2_norm(gradient)
+
+    guard.clip_stats.total_gradients = guard.clip_stats.total_gradients + 1
+
+    // Running average of norms
+    let prev_avg = guard.clip_stats.avg_original_norm
+    let n = guard.clip_stats.total_gradients
+    guard.clip_stats.avg_original_norm = prev_avg + (norm - prev_avg) / n
+
+    if norm > guard.clip_stats.max_original_norm {
+        guard.clip_stats.max_original_norm = norm
+    }
+
+    if norm > guard.config.clip_norm {
+        guard.clip_stats.total_clips = guard.clip_stats.total_clips + 1
+        let scale = guard.config.clip_norm / norm
+        let clipped = scale_vector(gradient, scale)
+        guard.clip_stats.clip_fraction = guard.clip_stats.total_clips * 1.0 /
+                                          guard.clip_stats.total_gradients
+        return clipped
+    }
+
+    guard.clip_stats.clip_fraction = guard.clip_stats.total_clips * 1.0 /
+                                      guard.clip_stats.total_gradients
+    return gradient
+}
+
+fn clip_gradient_layers(guard: PrivacyGuard, layers: array) -> array {
+    let clipped = []
+    let i = 0
+    while i < length(layers) {
+        let layer = layers[i]
+        let clipped_w = clip_gradient(guard, layer.weights)
+        let clipped_b = clip_gradient(guard, layer.bias)
+        push(clipped, LayerWeights {
+            weights: clipped_w,
+            rows: layer.rows,
+            cols: layer.cols,
+            bias: clipped_b
+        })
+        i = i + 1
+    }
+    return clipped
+}
+
+// --- Noise Generation -------------------------------------------------------
+
+fn generate_laplace_noise(guard: PrivacyGuard, size: i32, scale: f32) -> array {
+    // Laplace noise: b = sensitivity / epsilon
+    let noise = []
+    let i = 0
+    while i < size {
+        let u = next_uniform(guard)
+        // Inverse CDF of Laplace: x = -b * sign(u - 0.5) * ln(1 - 2|u - 0.5|)
+        let centered = u - 0.5
+        let sign = 1.0
+        if centered < 0.0 { sign = -1.0 }
+        let abs_c = abs_f32(centered)
+        if abs_c > 0.4999 { abs_c = 0.4999 }
+        let val = -scale * sign * log(1.0 - 2.0 * abs_c)
+        push(noise, val)
+        i = i + 1
+    }
+    return noise
+}
+
+fn generate_gaussian_noise(guard: PrivacyGuard, size: i32, sigma: f32) -> array {
+    // Gaussian noise using Box-Muller transform
+    let noise = []
+    let i = 0
+    while i < size {
+        let u1 = next_uniform(guard)
+        let u2 = next_uniform(guard)
+        // Clamp to avoid log(0)
+        if u1 < 0.0001 { u1 = 0.0001 }
+        let z = sqrt(-2.0 * log(u1)) * cos(2.0 * 3.14159265 * u2)
+        push(noise, z * sigma)
+        i = i + 1
+    }
+    return noise
+}
+
+fn next_uniform(guard: PrivacyGuard) -> f32 {
+    // Linear congruential generator
+    guard.rng_state = (guard.rng_state * 1103515245 + 12345) % 2147483647
+    if guard.rng_state < 0 { guard.rng_state = -guard.rng_state }
+    return guard.rng_state * 1.0 / 2147483647.0
+}
+
+// --- Core Privacy Mechanism -------------------------------------------------
+
+fn add_noise_to_gradient(guard: PrivacyGuard, gradient: array) -> NoisedGradient {
+    // Step 1: Clip gradient
+    let clipped = clip_gradient(guard, gradient)
+    let original_norm = vector_l2_norm(gradient)
+    let was_clipped = original_norm > guard.config.clip_norm
+
+    // Step 2: Compute noise scale
+    let noise_scale = compute_noise_scale(guard)
+
+    // Step 3: Generate and add noise
+    let noise = []
+    if guard.config.mechanism == "laplace" {
+        noise = generate_laplace_noise(guard, length(clipped), noise_scale)
+    } else {
+        noise = generate_gaussian_noise(guard, length(clipped), noise_scale)
+    }
+
+    let noised = vector_add(clipped, noise)
+
+    // Step 4: Track privacy cost
+    let eps_cost = guard.config.epsilon
+    guard.budget = spend_budget(guard.budget, eps_cost)
+    guard.total_queries = guard.total_queries + 1
+
+    // Step 5: Update noise stats
+    let noise_norm = vector_l2_norm(noise)
+    let signal_norm = vector_l2_norm(clipped)
+    let snr = 0.0
+    if noise_norm > 0.0 {
+        snr = signal_norm / noise_norm
+    }
+    push(guard.noise_stats.snr_history, snr)
+    guard.noise_stats.total_noise_added = guard.noise_stats.total_noise_added + noise_norm
+    guard.noise_stats.avg_noise_scale = guard.noise_stats.total_noise_added / guard.total_queries
+
+    return NoisedGradient {
+        original_norm: original_norm,
+        noised_values: noised,
+        noise_scale: noise_scale,
+        clipped: was_clipped,
+        epsilon_cost: eps_cost
+    }
+}
+
+fn add_noise_to_layers(guard: PrivacyGuard, layers: array) -> array {
+    let noised_layers = []
+    let i = 0
+    while i < length(layers) {
+        let layer = layers[i]
+        let w_result = add_noise_to_gradient(guard, layer.weights)
+        let b_result = add_noise_to_gradient(guard, layer.bias)
+        push(noised_layers, LayerWeights {
+            weights: w_result.noised_values,
+            rows: layer.rows,
+            cols: layer.cols,
+            bias: b_result.noised_values
+        })
+        i = i + 1
+    }
+    return noised_layers
+}
+
+fn compute_noise_scale(guard: PrivacyGuard) -> f32 {
+    let scale = 0.0
+    if guard.config.mechanism == "laplace" {
+        // Laplace: b = sensitivity / epsilon
+        scale = guard.config.sensitivity / guard.config.epsilon
+    } else {
+        // Gaussian: sigma = sensitivity * sqrt(2 * ln(1.25/delta)) / epsilon
+        let log_term = log(1.25 / guard.config.delta)
+        if log_term < 0.0 { log_term = 1.0 }
+        scale = guard.config.sensitivity * sqrt(2.0 * log_term) / guard.config.epsilon
+    }
+    // Apply multiplier
+    scale = scale * guard.config.noise_multiplier
+    // Floor
+    if scale < guard.config.min_noise_scale {
+        scale = guard.config.min_noise_scale
+    }
+    return scale
+}
+
+// --- Privacy Budget Accounting ----------------------------------------------
+// Renyi Differential Privacy (RDP) composition for tighter bounds
+
+fn spend_budget(budget: PrivacyBudget, epsilon: f32) -> PrivacyBudget {
+    if budget.composition == "basic" {
+        // Basic composition: epsilon sums linearly
+        budget.spent_budget = budget.spent_budget + epsilon
+    } else if budget.composition == "advanced" {
+        // Advanced composition: sqrt(2k * ln(1/delta)) * eps + k * eps^2
+        budget.spent_budget = budget.spent_budget + epsilon
+    } else {
+        // RDP composition: accumulate RDP epsilons per alpha
+        let i = 0
+        while i < length(budget.rdp_alphas) {
+            let alpha = budget.rdp_alphas[i]
+            let rdp_eps = compute_rdp_epsilon(epsilon, alpha)
+            budget.rdp_epsilons[i] = budget.rdp_epsilons[i] + rdp_eps
+            i = i + 1
+        }
+        // Convert best RDP bound to (eps, delta)-DP
+        budget.spent_budget = rdp_to_dp(budget.rdp_alphas, budget.rdp_epsilons, 0.00001)
+    }
+
+    budget.rounds_used = budget.rounds_used + 1
+    budget.remaining_budget = budget.total_budget - budget.spent_budget
+
+    if budget.remaining_budget <= 0.0 {
+        budget.is_exhausted = true
+    }
+
+    return budget
+}
+
+fn compute_rdp_epsilon(epsilon: f32, alpha: f32) -> f32 {
+    // RDP for Gaussian mechanism: alpha * sigma^2 / (2 * sensitivity^2)
+    // Simplified: proportional to epsilon^2 * alpha
+    return alpha * epsilon * epsilon / 2.0
+}
+
+fn rdp_to_dp(alphas: array, rdp_eps: array, delta: f32) -> f32 {
+    // Convert RDP to (epsilon, delta)-DP
+    // eps = min over alpha: rdp_eps(alpha) + log(1/delta) / (alpha - 1)
+    let best_eps = 999999.0
+    let log_delta = log(1.0 / delta)
+    let i = 0
+    while i < length(alphas) {
+        let alpha = alphas[i]
+        if alpha > 1.0 {
+            let eps = rdp_eps[i] + log_delta / (alpha - 1.0)
+            if eps < best_eps {
+                best_eps = eps
+            }
+        }
+        i = i + 1
+    }
+    return best_eps
+}
+
+fn get_remaining_budget(guard: PrivacyGuard) -> f32 {
+    return guard.budget.remaining_budget
+}
+
+fn get_spent_epsilon(guard: PrivacyGuard) -> f32 {
+    return guard.budget.spent_budget
+}
+
+fn is_budget_exhausted(guard: PrivacyGuard) -> bool {
+    return guard.budget.is_exhausted
+}
+
+fn get_effective_epsilon(guard: PrivacyGuard) -> f32 {
+    // The actual per-round epsilon after composition
+    if guard.budget.rounds_used == 0 { return 0.0 }
+    return guard.budget.spent_budget / guard.budget.rounds_used
+}
+
+// --- Secure Aggregation (SecAgg) Protocol -----------------------------------
+// Bonawitz et al., "Practical Secure Aggregation for Privacy-Preserving ML"
+
+fn create_secure_aggregation(num_participants: i32, threshold: i32) -> SecureAggregation {
+    return SecureAggregation {
+        num_participants: num_participants,
+        threshold: threshold,
+        masked_updates: [],
+        pairwise_masks: [],
+        is_complete: false,
+        dropout_tolerance: 0.3
+    }
+}
+
+fn generate_pairwise_mask(client_a: string, client_b: string,
+                           size: i32, seed: i32) -> array {
+    // Generate deterministic mask between two clients
+    // Both clients can compute the same mask independently
+    let mask = []
+    let state = seed
+    let i = 0
+    while i < size {
+        state = (state * 1664525 + 1013904223) % 2147483647
+        let val = (state % 10000) / 10000.0 - 0.5
+        push(mask, val)
+        i = i + 1
+    }
+    return mask
+}
+
+fn mask_gradient(gradient: array, masks_add: array, masks_sub: array) -> array {
+    // masked = gradient + sum(masks_to_add) - sum(masks_to_subtract)
+    let result = clone_array_sa(gradient)
+    let i = 0
+
+    // Add masks (for clients with higher ID)
+    while i < length(masks_add) {
+        let mask = masks_add[i]
+        let j = 0
+        while j < length(result) && j < length(mask) {
+            result[j] = result[j] + mask[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Subtract masks (for clients with lower ID)
+    i = 0
+    while i < length(masks_sub) {
+        let mask = masks_sub[i]
+        let j = 0
+        while j < length(result) && j < length(mask) {
+            result[j] = result[j] - mask[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    return result
+}
+
+fn unmask_aggregate(masked_sum: array, dropout_masks: array) -> array {
+    // Remove masks for dropped-out clients
+    let result = clone_array_sa(masked_sum)
+    let i = 0
+    while i < length(dropout_masks) {
+        let mask = dropout_masks[i]
+        let j = 0
+        while j < length(result) && j < length(mask) {
+            result[j] = result[j] - mask[j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// --- Privacy Verification ---------------------------------------------------
+
+fn verify_dp_guarantee(guard: PrivacyGuard) -> PrivacyVerification {
+    let effective_eps = get_effective_epsilon(guard)
+    let total_eps = guard.budget.spent_budget
+    let rounds = guard.budget.rounds_used
+
+    let r2_satisfied = effective_eps < 0.1  // R2: epsilon < 0.1
+
+    let avg_snr = 0.0
+    if length(guard.noise_stats.snr_history) > 0 {
+        let sum = 0.0
+        let i = 0
+        while i < length(guard.noise_stats.snr_history) {
+            sum = sum + guard.noise_stats.snr_history[i]
+            i = i + 1
+        }
+        avg_snr = sum / length(guard.noise_stats.snr_history)
+    }
+
+    return PrivacyVerification {
+        per_round_epsilon: effective_eps,
+        total_epsilon: total_eps,
+        rounds_completed: rounds,
+        budget_remaining: guard.budget.remaining_budget,
+        r2_satisfied: r2_satisfied,
+        clip_fraction: guard.clip_stats.clip_fraction,
+        avg_snr: avg_snr,
+        noise_scale_used: compute_noise_scale(guard),
+        mechanism: guard.config.mechanism,
+        composition: guard.config.composition
+    }
+}
+
+struct PrivacyVerification {
+    per_round_epsilon: f32,
+    total_epsilon: f32,
+    rounds_completed: i32,
+    budget_remaining: f32,
+    r2_satisfied: bool,
+    clip_fraction: f32,
+    avg_snr: f32,
+    noise_scale_used: f32,
+    mechanism: string,
+    composition: string
+}
+
+// --- Utility for Privacy Layer ----------------------------------------------
+
+struct LayerWeights {
+    weights: array,
+    rows: i32,
+    cols: i32,
+    bias: array
+}
+
+fn vector_l2_norm(arr: array) -> f32 {
+    let sum_sq = 0.0
+    let i = 0
+    while i < length(arr) {
+        sum_sq = sum_sq + arr[i] * arr[i]
+        i = i + 1
+    }
+    return sqrt(sum_sq)
+}
+
+fn scale_vector(arr: array, scalar: f32) -> array {
+    let result = []
+    let i = 0
+    while i < length(arr) {
+        push(result, arr[i] * scalar)
+        i = i + 1
+    }
+    return result
+}
+
+fn vector_add(a: array, b: array) -> array {
+    let result = []
+    let i = 0
+    while i < length(a) {
+        let b_val = 0.0
+        if i < length(b) { b_val = b[i] }
+        push(result, a[i] + b_val)
+        i = i + 1
+    }
+    return result
+}
+
+fn clone_array_sa(arr: array) -> array {
+    let result = []
+    let i = 0
+    while i < length(arr) {
+        push(result, arr[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn sqrt(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0 }
+    let guess = x / 2.0
+    let i = 0
+    while i < 20 {
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    }
+    return guess
+}
+
+fn log(x: f32) -> f32 {
+    if x <= 0.0 { return -999999.0 }
+    let y = 0.0
+    let i = 0
+    while i < 30 {
+        let ey = exp(y)
+        y = y + 2.0 * (x - ey) / (x + ey)
+        i = i + 1
+    }
+    return y
+}
+
+fn exp(x: f32) -> f32 {
+    let result = 1.0
+    let term = 1.0
+    let i = 1
+    while i < 20 {
+        term = term * x / i
+        result = result + term
+        i = i + 1
+    }
+    return result
+}
+
+fn cos(x: f32) -> f32 {
+    // Taylor series: cos(x) = 1 - x^2/2! + x^4/4! - ...
+    let result = 1.0
+    let term = 1.0
+    let i = 1
+    while i < 10 {
+        term = -term * x * x / ((2 * i - 1) * (2 * i))
+        result = result + term
+        i = i + 1
+    }
+    return result
+}
+
+fn abs_f32(x: f32) -> f32 {
+    if x < 0.0 { return -x }
+    return x
+}

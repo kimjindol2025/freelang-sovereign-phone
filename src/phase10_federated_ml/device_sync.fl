@@ -1,0 +1,752 @@
+// =============================================================================
+// Phase 10: Device Synchronization Protocol
+// =============================================================================
+// Handles model distribution to clients, update collection, bandwidth-aware
+// synchronization, and fault-tolerant communication.
+//
+// Unforgiving Rule R4: Device sync latency <5s
+// Unforgiving Rule R9: Bandwidth efficiency >80% (useful/total bytes)
+// =============================================================================
+
+// --- Sync Protocol Types ----------------------------------------------------
+
+struct SyncMessage {
+    msg_type: string,       // "model_push", "update_pull", "heartbeat", "ack", "nack"
+    sender_id: string,
+    receiver_id: string,
+    round_id: i32,
+    payload_size: i32,      // bytes
+    payload_hash: i32,      // integrity check
+    sequence_num: i32,
+    timestamp: i32,
+    priority: i32,          // 0=low, 1=normal, 2=high, 3=critical
+    ttl: i32                // time-to-live in ms
+}
+
+struct SyncSession {
+    session_id: string,
+    server_id: string,
+    client_id: string,
+    round_id: i32,
+    status: string,         // "init", "sending", "receiving", "complete", "failed", "timeout"
+    start_time: i32,
+    end_time: i32,
+    bytes_sent: i32,
+    bytes_received: i32,
+    retries: i32,
+    max_retries: i32,
+    chunk_size: i32,        // adaptive chunk size
+    total_chunks: i32,
+    acked_chunks: i32,
+    latency_ms: f32,
+    bandwidth_bps: f32      // measured bandwidth
+}
+
+struct DeviceSyncManager {
+    server_id: string,
+    active_sessions: array,     // array of SyncSession
+    completed_sessions: array,
+    pending_queue: array,       // priority queue of sync requests
+    bandwidth_estimator: BandwidthEstimator,
+    compression_engine: CompressionEngine,
+    retry_policy: RetryPolicy,
+    max_concurrent: i32,
+    total_syncs: i32,
+    total_bytes: i32,
+    failed_syncs: i32,
+    avg_latency_ms: f32
+}
+
+struct BandwidthEstimator {
+    samples: array,         // recent bandwidth measurements (bps)
+    window_size: i32,
+    current_estimate: f32,
+    min_bandwidth: f32,
+    max_bandwidth: f32,
+    last_update: i32
+}
+
+struct CompressionEngine {
+    strategy: string,       // "none", "quantize", "sparse", "topk"
+    compression_ratio: f32,
+    topk_fraction: f32,     // for top-k: keep top k% of gradients
+    sparsity_threshold: f32,
+    total_compressed: i32,
+    total_original: i32
+}
+
+struct RetryPolicy {
+    max_retries: i32,
+    base_delay_ms: i32,
+    max_delay_ms: i32,
+    backoff_factor: f32,    // exponential backoff multiplier
+    jitter_factor: f32      // randomize delay to avoid thundering herd
+}
+
+struct SyncRequest {
+    client_id: string,
+    round_id: i32,
+    request_type: string,   // "download_model", "upload_update"
+    priority: i32,
+    estimated_size: i32,
+    timestamp: i32
+}
+
+struct ChunkTransfer {
+    chunk_id: i32,
+    total_chunks: i32,
+    data_size: i32,
+    checksum: i32,
+    status: string,         // "pending", "sent", "acked", "failed"
+    send_time: i32,
+    ack_time: i32,
+    retries: i32
+}
+
+// --- Bandwidth Estimation ---------------------------------------------------
+
+fn create_bandwidth_estimator(window: i32) -> BandwidthEstimator {
+    return BandwidthEstimator {
+        samples: [],
+        window_size: window,
+        current_estimate: 1000000.0,  // default 1 Mbps
+        min_bandwidth: 100000.0,       // 100 Kbps minimum
+        max_bandwidth: 100000000.0,    // 100 Mbps maximum
+        last_update: 0
+    }
+}
+
+fn update_bandwidth_estimate(est: BandwidthEstimator, bytes: i32, time_ms: f32) -> BandwidthEstimator {
+    if time_ms <= 0.0 {
+        return est
+    }
+    let bps = (bytes * 8000.0) / time_ms  // bits per second
+    push(est.samples, bps)
+
+    // Keep only recent samples (sliding window)
+    while length(est.samples) > est.window_size {
+        // Remove oldest
+        let new_samples = []
+        let i = 1
+        while i < length(est.samples) {
+            push(new_samples, est.samples[i])
+            i = i + 1
+        }
+        est.samples = new_samples
+    }
+
+    // Exponentially weighted moving average
+    let total = 0.0
+    let weight = 0.0
+    let decay = 0.9
+    let i = length(est.samples) - 1
+    let w = 1.0
+    while i >= 0 {
+        total = total + w * est.samples[i]
+        weight = weight + w
+        w = w * decay
+        i = i - 1
+    }
+    est.current_estimate = total / weight
+
+    // Clamp to reasonable range
+    if est.current_estimate < est.min_bandwidth {
+        est.current_estimate = est.min_bandwidth
+    }
+    if est.current_estimate > est.max_bandwidth {
+        est.current_estimate = est.max_bandwidth
+    }
+
+    // Track min/max
+    if bps < est.min_bandwidth { est.min_bandwidth = bps }
+    if bps > est.max_bandwidth { est.max_bandwidth = bps }
+
+    est.last_update = timestamp_now()
+    return est
+}
+
+fn estimate_transfer_time(est: BandwidthEstimator, bytes: i32) -> f32 {
+    // Time in ms = (bytes * 8 * 1000) / bps
+    return (bytes * 8000.0) / est.current_estimate
+}
+
+fn get_optimal_chunk_size(est: BandwidthEstimator) -> i32 {
+    // Adaptive chunk size based on bandwidth
+    // Low bandwidth: smaller chunks (more reliability)
+    // High bandwidth: larger chunks (less overhead)
+    let bw_mbps = est.current_estimate / 1000000.0
+    if bw_mbps < 1.0 {
+        return 4096          // 4 KB for very slow connections
+    } else if bw_mbps < 10.0 {
+        return 32768         // 32 KB for moderate connections
+    } else if bw_mbps < 50.0 {
+        return 131072        // 128 KB for fast connections
+    } else {
+        return 524288        // 512 KB for very fast connections
+    }
+}
+
+// --- Compression Engine -----------------------------------------------------
+
+fn create_compression_engine(strategy: string) -> CompressionEngine {
+    let topk = 0.1
+    let sparse_thresh = 0.001
+    if strategy == "topk" {
+        topk = 0.1  // Keep top 10%
+    }
+    return CompressionEngine {
+        strategy: strategy,
+        compression_ratio: 1.0,
+        topk_fraction: topk,
+        sparsity_threshold: sparse_thresh,
+        total_compressed: 0,
+        total_original: 0
+    }
+}
+
+fn compress_gradients(engine: CompressionEngine, gradients: array) -> array {
+    if engine.strategy == "none" {
+        return gradients
+    }
+
+    let compressed = []
+
+    if engine.strategy == "topk" {
+        compressed = topk_compress(gradients, engine.topk_fraction)
+    } else if engine.strategy == "sparse" {
+        compressed = sparse_compress(gradients, engine.sparsity_threshold)
+    } else if engine.strategy == "quantize" {
+        compressed = quantize_compress(gradients)
+    }
+
+    engine.total_original = engine.total_original + length(gradients)
+    engine.total_compressed = engine.total_compressed + length(compressed)
+    if engine.total_original > 0 {
+        engine.compression_ratio = engine.total_compressed / engine.total_original
+    }
+
+    return compressed
+}
+
+fn topk_compress(gradients: array, fraction: f32) -> array {
+    // Keep only top-k% of gradients by magnitude
+    let k = max_i32(1, floor(length(gradients) * fraction))
+
+    // Find k-th largest magnitude (simplified: sort absolute values)
+    let magnitudes = []
+    let i = 0
+    while i < length(gradients) {
+        push(magnitudes, abs_f32(gradients[i]))
+        i = i + 1
+    }
+
+    // Find threshold using partial sort (simplified)
+    let threshold = find_kth_largest(magnitudes, k)
+
+    // Keep only values above threshold
+    let result = []
+    i = 0
+    while i < length(gradients) {
+        if abs_f32(gradients[i]) >= threshold {
+            push(result, gradients[i])
+        } else {
+            push(result, 0.0)  // zero out small gradients
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn sparse_compress(gradients: array, threshold: f32) -> array {
+    // Zero out gradients below threshold
+    let result = []
+    let i = 0
+    while i < length(gradients) {
+        if abs_f32(gradients[i]) >= threshold {
+            push(result, gradients[i])
+        } else {
+            push(result, 0.0)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn quantize_compress(gradients: array) -> array {
+    // 1-bit quantization (sign only) with scale
+    if length(gradients) == 0 { return gradients }
+
+    let sum_abs = 0.0
+    let i = 0
+    while i < length(gradients) {
+        sum_abs = sum_abs + abs_f32(gradients[i])
+        i = i + 1
+    }
+    let scale = sum_abs / length(gradients)
+
+    let result = []
+    i = 0
+    while i < length(gradients) {
+        if gradients[i] >= 0.0 {
+            push(result, scale)
+        } else {
+            push(result, -scale)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn find_kth_largest(arr: array, k: i32) -> f32 {
+    // Simple selection: sort descending, pick k-th
+    let sorted = clone_array_sync(arr)
+    // Bubble sort top-k elements (efficient enough for our use)
+    let i = 0
+    while i < k && i < length(sorted) {
+        let j = i + 1
+        while j < length(sorted) {
+            if sorted[j] > sorted[i] {
+                let tmp = sorted[i]
+                sorted[i] = sorted[j]
+                sorted[j] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if k - 1 < length(sorted) {
+        return sorted[k - 1]
+    }
+    return 0.0
+}
+
+fn clone_array_sync(arr: array) -> array {
+    let result = []
+    let i = 0
+    while i < length(arr) {
+        push(result, arr[i])
+        i = i + 1
+    }
+    return result
+}
+
+// --- Retry Policy -----------------------------------------------------------
+
+fn create_retry_policy(max_retries: i32, base_delay: i32, max_delay: i32) -> RetryPolicy {
+    return RetryPolicy {
+        max_retries: max_retries,
+        base_delay_ms: base_delay,
+        max_delay_ms: max_delay,
+        backoff_factor: 2.0,
+        jitter_factor: 0.1
+    }
+}
+
+fn compute_retry_delay(policy: RetryPolicy, attempt: i32) -> i32 {
+    // Exponential backoff with jitter
+    let delay = policy.base_delay_ms
+    let i = 0
+    while i < attempt {
+        delay = floor(delay * policy.backoff_factor)
+        i = i + 1
+    }
+    if delay > policy.max_delay_ms {
+        delay = policy.max_delay_ms
+    }
+    // Add jitter: +-10%
+    let jitter = floor(delay * policy.jitter_factor)
+    let jitter_val = ((attempt * 7919) % (jitter * 2 + 1)) - jitter
+    delay = delay + jitter_val
+    if delay < 0 { delay = 0 }
+    return delay
+}
+
+fn should_retry(policy: RetryPolicy, attempt: i32) -> bool {
+    return attempt < policy.max_retries
+}
+
+// --- Device Sync Manager ---------------------------------------------------
+
+fn create_sync_manager(server_id: string, max_concurrent: i32) -> DeviceSyncManager {
+    return DeviceSyncManager {
+        server_id: server_id,
+        active_sessions: [],
+        completed_sessions: [],
+        pending_queue: [],
+        bandwidth_estimator: create_bandwidth_estimator(20),
+        compression_engine: create_compression_engine("topk"),
+        retry_policy: create_retry_policy(3, 500, 10000),
+        max_concurrent: max_concurrent,
+        total_syncs: 0,
+        total_bytes: 0,
+        failed_syncs: 0,
+        avg_latency_ms: 0.0
+    }
+}
+
+fn enqueue_sync(manager: DeviceSyncManager, request: SyncRequest) -> DeviceSyncManager {
+    // Insert by priority (higher priority first)
+    let inserted = false
+    let new_queue = []
+    let i = 0
+    while i < length(manager.pending_queue) {
+        if !inserted && request.priority > manager.pending_queue[i].priority {
+            push(new_queue, request)
+            inserted = true
+        }
+        push(new_queue, manager.pending_queue[i])
+        i = i + 1
+    }
+    if !inserted {
+        push(new_queue, request)
+    }
+    manager.pending_queue = new_queue
+    return manager
+}
+
+fn start_sync_session(manager: DeviceSyncManager, client_id: string,
+                       round_id: i32) -> SyncSession {
+    let chunk_size = get_optimal_chunk_size(manager.bandwidth_estimator)
+
+    let session = SyncSession {
+        session_id: manager.server_id + "_" + client_id + "_r" + to_string(round_id),
+        server_id: manager.server_id,
+        client_id: client_id,
+        round_id: round_id,
+        status: "init",
+        start_time: timestamp_now(),
+        end_time: 0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        retries: 0,
+        max_retries: manager.retry_policy.max_retries,
+        chunk_size: chunk_size,
+        total_chunks: 0,
+        acked_chunks: 0,
+        latency_ms: 0.0,
+        bandwidth_bps: 0.0
+    }
+
+    push(manager.active_sessions, session)
+    manager.total_syncs = manager.total_syncs + 1
+    return session
+}
+
+fn complete_sync_session(manager: DeviceSyncManager, session: SyncSession) -> DeviceSyncManager {
+    session.status = "complete"
+    session.end_time = timestamp_now()
+    session.latency_ms = (session.end_time - session.start_time) * 1.0
+
+    // Update bandwidth estimator
+    let total_bytes = session.bytes_sent + session.bytes_received
+    if session.latency_ms > 0.0 {
+        manager.bandwidth_estimator = update_bandwidth_estimate(
+            manager.bandwidth_estimator, total_bytes, session.latency_ms
+        )
+    }
+
+    // Move from active to completed
+    let new_active = []
+    let i = 0
+    while i < length(manager.active_sessions) {
+        if manager.active_sessions[i].session_id != session.session_id {
+            push(new_active, manager.active_sessions[i])
+        }
+        i = i + 1
+    }
+    manager.active_sessions = new_active
+    push(manager.completed_sessions, session)
+
+    // Update average latency (running average)
+    let completed = length(manager.completed_sessions)
+    manager.avg_latency_ms = ((manager.avg_latency_ms * (completed - 1)) + session.latency_ms) / completed
+    manager.total_bytes = manager.total_bytes + total_bytes
+
+    return manager
+}
+
+fn fail_sync_session(manager: DeviceSyncManager, session: SyncSession,
+                      reason: string) -> DeviceSyncManager {
+    session.status = "failed"
+    session.end_time = timestamp_now()
+    manager.failed_syncs = manager.failed_syncs + 1
+
+    // Check if should retry
+    if should_retry(manager.retry_policy, session.retries) {
+        session.retries = session.retries + 1
+        session.status = "init"
+        // Re-enqueue with higher priority
+        let retry_req = SyncRequest {
+            client_id: session.client_id,
+            round_id: session.round_id,
+            request_type: "retry",
+            priority: 3,   // critical priority for retries
+            estimated_size: session.bytes_sent,
+            timestamp: timestamp_now()
+        }
+        manager = enqueue_sync(manager, retry_req)
+    } else {
+        // Permanently failed
+        let new_active = []
+        let i = 0
+        while i < length(manager.active_sessions) {
+            if manager.active_sessions[i].session_id != session.session_id {
+                push(new_active, manager.active_sessions[i])
+            }
+            i = i + 1
+        }
+        manager.active_sessions = new_active
+        push(manager.completed_sessions, session)
+    }
+    return manager
+}
+
+// --- Chunk-based Transfer ---------------------------------------------------
+
+fn create_chunk_plan(total_bytes: i32, chunk_size: i32) -> array {
+    let chunks = []
+    let offset = 0
+    let id = 0
+    let total = ceil_div(total_bytes, chunk_size)
+    while offset < total_bytes {
+        let size = min_i32(chunk_size, total_bytes - offset)
+        push(chunks, ChunkTransfer {
+            chunk_id: id,
+            total_chunks: total,
+            data_size: size,
+            checksum: compute_checksum(offset, size),
+            status: "pending",
+            send_time: 0,
+            ack_time: 0,
+            retries: 0
+        })
+        offset = offset + size
+        id = id + 1
+    }
+    return chunks
+}
+
+fn send_chunk(chunk: ChunkTransfer) -> ChunkTransfer {
+    chunk.status = "sent"
+    chunk.send_time = timestamp_now()
+    return chunk
+}
+
+fn ack_chunk(chunk: ChunkTransfer) -> ChunkTransfer {
+    chunk.status = "acked"
+    chunk.ack_time = timestamp_now()
+    return chunk
+}
+
+fn get_transfer_progress(chunks: array) -> f32 {
+    if length(chunks) == 0 { return 1.0 }
+    let acked = 0
+    let i = 0
+    while i < length(chunks) {
+        if chunks[i].status == "acked" {
+            acked = acked + 1
+        }
+        i = i + 1
+    }
+    return acked * 1.0 / length(chunks)
+}
+
+fn compute_checksum(offset: i32, size: i32) -> i32 {
+    // Simple polynomial hash for chunk integrity
+    let hash = 5381
+    hash = hash * 33 + offset
+    hash = hash * 33 + size
+    return hash % 2147483647
+}
+
+fn ceil_div(a: i32, b: i32) -> i32 {
+    if b == 0 { return 0 }
+    return (a + b - 1) / b
+}
+
+// --- Model Delta Compression -----------------------------------------------
+// Only send the difference between global and local models
+
+fn compute_model_delta(local: ModelWeights, global: ModelWeights) -> array {
+    let deltas = []
+    let i = 0
+    while i < local.num_layers {
+        let l_layer = local.layers[i]
+        let g_layer = global.layers[i]
+        let w_delta = []
+        let j = 0
+        while j < length(l_layer.weights) {
+            push(w_delta, l_layer.weights[j] - g_layer.weights[j])
+            j = j + 1
+        }
+        let b_delta = []
+        j = 0
+        while j < length(l_layer.bias) {
+            push(b_delta, l_layer.bias[j] - g_layer.bias[j])
+            j = j + 1
+        }
+        push(deltas, LayerWeights {
+            weights: w_delta,
+            rows: l_layer.rows,
+            cols: l_layer.cols,
+            bias: b_delta
+        })
+        i = i + 1
+    }
+    return deltas
+}
+
+fn apply_model_delta(global: ModelWeights, deltas: array) -> ModelWeights {
+    let new_layers = []
+    let i = 0
+    while i < global.num_layers {
+        let g_layer = global.layers[i]
+        let d_layer = deltas[i]
+        let new_w = []
+        let j = 0
+        while j < length(g_layer.weights) {
+            push(new_w, g_layer.weights[j] + d_layer.weights[j])
+            j = j + 1
+        }
+        let new_b = []
+        j = 0
+        while j < length(g_layer.bias) {
+            push(new_b, g_layer.bias[j] + d_layer.bias[j])
+            j = j + 1
+        }
+        push(new_layers, LayerWeights {
+            weights: new_w,
+            rows: g_layer.rows,
+            cols: g_layer.cols,
+            bias: new_b
+        })
+        i = i + 1
+    }
+    return ModelWeights {
+        layers: new_layers,
+        num_layers: global.num_layers,
+        total_params: global.total_params,
+        version: global.version + 1
+    }
+}
+
+// --- Sync Statistics --------------------------------------------------------
+
+fn get_sync_stats(manager: DeviceSyncManager) -> SyncStats {
+    let success_rate = 0.0
+    if manager.total_syncs > 0 {
+        success_rate = (manager.total_syncs - manager.failed_syncs) * 1.0 / manager.total_syncs
+    }
+
+    let bandwidth_efficiency = 0.0
+    if manager.compression_engine.total_original > 0 {
+        bandwidth_efficiency = 1.0 - manager.compression_engine.compression_ratio
+    }
+
+    return SyncStats {
+        total_syncs: manager.total_syncs,
+        failed_syncs: manager.failed_syncs,
+        success_rate: success_rate,
+        avg_latency_ms: manager.avg_latency_ms,
+        total_bytes: manager.total_bytes,
+        bandwidth_efficiency: bandwidth_efficiency,
+        active_sessions: length(manager.active_sessions),
+        pending_requests: length(manager.pending_queue),
+        estimated_bandwidth_bps: manager.bandwidth_estimator.current_estimate
+    }
+}
+
+struct SyncStats {
+    total_syncs: i32,
+    failed_syncs: i32,
+    success_rate: f32,
+    avg_latency_ms: f32,
+    total_bytes: i32,
+    bandwidth_efficiency: f32,
+    active_sessions: i32,
+    pending_requests: i32,
+    estimated_bandwidth_bps: f32
+}
+
+// --- Process Pending Queue --------------------------------------------------
+
+fn process_pending_syncs(manager: DeviceSyncManager) -> DeviceSyncManager {
+    while length(manager.pending_queue) > 0 &&
+          length(manager.active_sessions) < manager.max_concurrent {
+        let request = manager.pending_queue[0]
+        // Dequeue
+        let new_queue = []
+        let i = 1
+        while i < length(manager.pending_queue) {
+            push(new_queue, manager.pending_queue[i])
+            i = i + 1
+        }
+        manager.pending_queue = new_queue
+
+        // Start session
+        let session = start_sync_session(manager, request.client_id, request.round_id)
+        session.status = "sending"
+    }
+    return manager
+}
+
+// --- Simulate Full Sync Round -----------------------------------------------
+
+fn simulate_sync_round(manager: DeviceSyncManager, client_ids: array,
+                        round_id: i32, model_size_bytes: i32) -> DeviceSyncManager {
+    // Enqueue all client syncs
+    let i = 0
+    while i < length(client_ids) {
+        let req = SyncRequest {
+            client_id: client_ids[i],
+            round_id: round_id,
+            request_type: "download_model",
+            priority: 1,
+            estimated_size: model_size_bytes,
+            timestamp: timestamp_now()
+        }
+        manager = enqueue_sync(manager, req)
+        i = i + 1
+    }
+
+    // Process all pending
+    manager = process_pending_syncs(manager)
+
+    // Simulate completion of all active sessions
+    let sessions_to_complete = clone_array_sync(manager.active_sessions)
+    i = 0
+    while i < length(sessions_to_complete) {
+        let session = sessions_to_complete[i]
+        session.bytes_sent = model_size_bytes
+        session.bytes_received = model_size_bytes / 10  // updates are ~10% of model
+        manager = complete_sync_session(manager, session)
+        i = i + 1
+    }
+
+    return manager
+}
+
+// --- Utility (shared) -------------------------------------------------------
+
+fn abs_f32(x: f32) -> f32 {
+    if x < 0.0 { return -x }
+    return x
+}
+
+fn min_i32(a: i32, b: i32) -> i32 {
+    if a < b { return a }
+    return b
+}
+
+fn max_i32(a: i32, b: i32) -> i32 {
+    if a > b { return a }
+    return b
+}
+
+fn floor(x: f32) -> i32 {
+    return x
+}
+
+fn timestamp_now() -> i32 {
+    return 1709683200
+}
